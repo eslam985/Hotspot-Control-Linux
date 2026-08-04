@@ -2,17 +2,8 @@
 venv/
 .venv/
 
-# تجاهل مجلدات السجلات والظهور المؤقت
-data/logs/
-data/last_seen/
-
-# تجاهل ملفات قواعد البيانات الحية
-data/usage.db
-data/usage.sqlite
-
-# تجاهل ملفات التشغيل المؤقتة
-data/run.txt
-data/telegram_contacts.txt
+# تجاهل مجلد البيانات والإعدادات الحية بالكامل
+data/
 
 # ملفات النظام المؤقتة والبيئة السرية
 .fuse_hidden*

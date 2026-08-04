@@ -1,0 +1,3 @@
+declare -A DEV_INFO
+# مثال: ["MAC_ADDRESS"]="NAME|IP_ADDRESS|"
+DEV_INFO["00:11:22:33:44:55"]="UserExample|192.168.12.100|"
