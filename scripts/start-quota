@@ -13,7 +13,7 @@ USAGE_DB="$BASE_DIR/usage.sqlite"
 mkdir -p "$BASE_DIR"
 
 # التأكد أن ملف القاعدة موجود، ولو مش موجود ننشئه بالجدول فوراً
-[ ! -f "$USAGE_DB" ] && sqlite3 "$USAGE_DB" ".timeout 5000" "CREATE TABLE devices (mac TEXT PRIMARY KEY, name TEXT, usage REAL);"
+[ ! -f "$USAGE_DB" ] && sqlite3 "$USAGE_DB" ".timeout 5000" "CREATE TABLE IF NOT EXISTS devices (mac TEXT PRIMARY KEY, name TEXT, usage REAL, chat_id TEXT, notified_25 INTEGER DEFAULT 0, notified_50 INTEGER DEFAULT 0, notified_75 INTEGER DEFAULT 0, notified_90 INTEGER DEFAULT 0, notified_100 INTEGER DEFAULT 0);"
 # مصفوفات لتتبع الحالة اللحظية
 declare -A LAST_RAW_BYTES   # آخر قراءة للعداد
 declare -A IS_ONLINE        # حالة الجهاز الحالية
@@ -25,12 +25,13 @@ declare -A DEV_INFO
 # استدعاء ملف الأجهزة
 source "$BASE_DIR/devices.conf"
 
-# تحديث قاعدة البيانات آلياً بناءً على الملف
+# تحديث قاعدة البيانات آلياً بناءً على الملف (شامل chat_id)
 for mac in "${!DEV_INFO[@]}"; do
-    IFS='|' read -r name ip <<< "${DEV_INFO[$mac]}"
+    IFS='|' read -r name ip chat_id <<< "${DEV_INFO[$mac]}"
+    chat_id=${chat_id:-""}
     sqlite3 "$USAGE_DB" "INSERT OR IGNORE INTO devices (mac, name, usage) VALUES ('$mac', '$name', 0.0);"
-    # لتحديث الاسم لو غيرته في الملف
-    sqlite3 "$USAGE_DB" "UPDATE devices SET name='$name' WHERE mac='$mac';"
+    # لتحديث الاسم والـ chat_id لو غيرتهم في الملف
+    sqlite3 "$USAGE_DB" "UPDATE devices SET name='$name', chat_id='$chat_id' WHERE mac='$mac';"
 done
 
 
@@ -50,7 +51,7 @@ human_readable() {
 sudo iptables -t mangle -F 2>/dev/null
 
 for MAC in "${!DEV_INFO[@]}"; do
-    IFS="|" read -r NAME IP <<< "${DEV_INFO[$MAC]}"
+    IFS="|" read -r NAME IP CHAT_ID <<< "${DEV_INFO[$MAC]}"
     
     # [التعديل الجوهري] إنشاء قواعد العد في أول جدول FORWARD
     # القاعدة 1: مراقبة الرفع (Upload) بالماك
@@ -78,27 +79,40 @@ for MAC_KEY in "${!DEV_INFO[@]}"; do
     LAST_QUOTA_VAL[$MAC_KEY]="INIT"
 done
 while true; do
+    # إعادة قراءة ملف الأجهزة وتحديث قاعدة البيانات تلقائياً في كل لفة
+    source "$BASE_DIR/devices.conf"
+    
     # 1. قراءة ملف الكوتا سطر بسطر
     while IFS='=' read -r RAW_MAC RAW_QUOTA || [ -n "$RAW_MAC" ]; do
         
-        # تصفية البيانات
         MAC=$(echo "$RAW_MAC" | tr -d '\r' | xargs | tr '[:upper:]' '[:lower:]')
         QUOTA_MB=$(echo "$RAW_QUOTA" | tr -d '\r' | xargs)
         
         [ -z "$MAC" ] && continue
         if [[ -z "${DEV_INFO[$MAC]}" ]]; then continue; fi
-        IFS="|" read -r NAME IP <<< "${DEV_INFO[$MAC]}"
+        
+        # قراءة البيانات الحديثة شاملة الـ CHAT_ID
+        IFS="|" read -r NAME IP CHAT_ID <<< "${DEV_INFO[$MAC]}"
+        CHAT_ID=${CHAT_ID:-""}
+
+        # تحديث القاعدة فقط إذا تغيرت البيانات فعلياً في devices.conf
+        sqlite3 "$USAGE_DB" ".timeout 5000" "UPDATE devices SET name='$NAME', chat_id='$CHAT_ID' WHERE mac='$MAC' AND (COALESCE(chat_id, '') != '$CHAT_ID' OR COALESCE(name, '') != '$NAME');"
 
         # --- [ أولوية قصوى: التصفير أولاً ] ---
         # لو الكوتا اتغيرت، بنصفر كل حاجة قبل ما نحسب أي بايت واحد
-# --- [ أولوية قصوى: التصفير أولاً ] ---
-        JUST_RESET=false # نعتبره false في بداية كل لفة لكل جهاز
+        JUST_RESET=false
         
         if [[ -n "${LAST_QUOTA_VAL[$MAC]}" && "${LAST_QUOTA_VAL[$MAC]}" != "INIT" && "${LAST_QUOTA_VAL[$MAC]}" != "$QUOTA_MB" ]]; then
              sqlite3 "$USAGE_DB" ".timeout 5000" "INSERT INTO system_logs (timestamp, mac, event_type, message) VALUES (datetime('now', 'localtime'), '$MAC', 'RESET', 'Quota updated to $QUOTA_MB MB. Resetting usage for $NAME.');"
-             # أضف هذا السطر تحت سطر sqlite3 الخاص بالـ RESET
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] ACTION: Quota updated to $QUOTA_MB MB. Counter zeroed for $NAME." >> "$LOG_DIR/$NAME.log"
-             sqlite3 "$USAGE_DB" ".timeout 5000" "UPDATE devices SET usage='0.00' WHERE mac='$MAC';"
+             echo "[$(date '+%Y-%m-%d %H:%M:%S')] ACTION: Quota updated to $QUOTA_MB MB. Counter zeroed for $NAME." >> "$LOG_DIR/$NAME.log"
+             
+             # تصفير الاستهلاك + تصفير أعلام إشعارات تليجرام
+             sqlite3 "$USAGE_DB" ".timeout 5000" "UPDATE devices SET usage='0.00', notified_25=0, notified_50=0, notified_75=0, notified_90=0, notified_100=0 WHERE mac='$MAC';"
+             
+             # إرسال رسالة التجديد فوراً عبر تليجرام
+             if [[ -n "$CHAT_ID" ]]; then
+                 bash /home/es/projects/hotspot-control/scripts/send_telegram.sh "$CHAT_ID" "✅ تم تجديد باقتك بنجاح يا ${NAME} 🥳! حجم الباقة الجديدة: ${QUOTA_MB} MB." &
+             fi
              
              SESSION_START_VAL[$MAC]=0
              LAST_RAW_BYTES[$MAC]=0 
@@ -148,13 +162,39 @@ while true; do
 
         NEW_TOTAL_MB=$(echo "scale=2; ${SESSION_START_VAL[$MAC]} + $CURRENT_SESSION_MB" | bc | sed 's/^\./0./; s/^-\./-0./')
 
-        # --- [ هنا يكمل كود الحظر الباقي كما هو عندك ] ---
-# 8. منطق الحظر الذكي (استخدام القوة في جدول RAW لضمان القطع)
-# 8. منطق الحظر الذكي (إضافة حماية الـ RESET)
+        # 8. منطق الحظر الذكي (استخدام القوة في جدول RAW لضمان القطع)
         V1=${NEW_TOTAL_MB:-0}
         V2=${QUOTA_MB:-0}
         IS_BLOCKED=$(echo "$V1 >= $V2" | bc -l | xargs)
-
+        # --- [ إشعارات تليجرام للاستهلاك ] ---
+        if [[ -n "$CHAT_ID" && $(echo "$QUOTA_MB > 0" | bc -l) -eq 1 ]]; then
+            PERCENT=$(echo "scale=0; ($NEW_TOTAL_MB * 100) / $QUOTA_MB" | bc)
+            
+            # جلب حالة الإشعارات
+            FLAGS=$(sqlite3 -batch "$USAGE_DB" ".timeout 5000" "SELECT notified_25, notified_50, notified_75, notified_90, notified_100 FROM devices WHERE mac='$MAC';" 2>/dev/null)
+            if [[ -n "$FLAGS" ]]; then
+                IFS='|' read -r n25 n50 n75 n90 n100 <<< "$FLAGS"
+                
+                # التحقق والتحديث (علامة & في آخر السطر تضمن عدم تعطيل اللوب)
+                if [ "$PERCENT" -ge 100 ] && [ "$n100" -eq 0 ]; then
+                    sqlite3 "$USAGE_DB" ".timeout 5000" "UPDATE devices SET notified_100=1 WHERE mac='$MAC';"
+                    bash /home/es/projects/hotspot-control/scripts/send_telegram.sh "$CHAT_ID" "🚨 لقد استهلكت 100% من باقتك (${QUOTA_MB} MB). تم إيقاف الإنترنت مؤقتاً." &
+                elif [ "$PERCENT" -ge 90 ] && [ "$PERCENT" -lt 100 ] && [ "$n90" -eq 0 ]; then
+                    sqlite3 "$USAGE_DB" ".timeout 5000" "UPDATE devices SET notified_90=1 WHERE mac='$MAC';"
+                    bash /home/es/projects/hotspot-control/scripts/send_telegram.sh "$CHAT_ID" "⚠️ تحذير شديد: استهلكت 90% من باقتك! المتبقي: $(echo "$QUOTA_MB - $NEW_TOTAL_MB" | bc) MB" &
+                elif [ "$PERCENT" -ge 75 ] && [ "$PERCENT" -lt 90 ] && [ "$n75" -eq 0 ]; then
+                    sqlite3 "$USAGE_DB" ".timeout 5000" "UPDATE devices SET notified_75=1 WHERE mac='$MAC';"
+                    bash /home/es/projects/hotspot-control/scripts/send_telegram.sh "$CHAT_ID" "⚠️ تنبيه: استهلكت 75% من باقتك." &
+                elif [ "$PERCENT" -ge 50 ] && [ "$PERCENT" -lt 75 ] && [ "$n50" -eq 0 ]; then
+                    sqlite3 "$USAGE_DB" ".timeout 5000" "UPDATE devices SET notified_50=1 WHERE mac='$MAC';"
+                    bash /home/es/projects/hotspot-control/scripts/send_telegram.sh "$CHAT_ID" "📊 استهلكت 50% (نصف الباقة). المتبقي: $(echo "$QUOTA_MB - $NEW_TOTAL_MB" | bc) MB" &
+                elif [ "$PERCENT" -ge 25 ] && [ "$PERCENT" -lt 50 ] && [ "$n25" -eq 0 ]; then
+                    sqlite3 "$USAGE_DB" ".timeout 5000" "UPDATE devices SET notified_25=1 WHERE mac='$MAC';"
+                    bash /home/es/projects/hotspot-control/scripts/send_telegram.sh "$CHAT_ID" "ℹ️ استهلكت 25% من باقتك." &
+                fi
+            fi
+        fi
+        # -------------------------------------
         # --- [ تعديل الحماية الأهم ] ---
         # لو الجهاز معدي الكوتا (IS_BLOCKED=1) بس لسه عامل ريسيت حالا (JUST_RESET=true)
         # السكريبت هيتجاهل الحظر في اللفة دي عشان يلحق يصفر الذاكرة

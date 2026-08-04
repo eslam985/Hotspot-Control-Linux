@@ -1,3 +1,7 @@
+# تجاهل البيئة الافتراضية للبايثون
+venv/
+.venv/
+
 # تجاهل مجلدات السجلات والظهور المؤقت
 data/logs/
 data/last_seen/
@@ -8,5 +12,8 @@ data/usage.sqlite
 
 # تجاهل ملفات التشغيل المؤقتة
 data/run.txt
+data/telegram_contacts.txt
 
+# ملفات النظام المؤقتة والبيئة السرية
 .fuse_hidden*
+.env

@@ -126,11 +126,11 @@ else
         
         c_name="Unknown"
         if [[ -n "$c_mac" && ${DEV_INFO[$c_mac]+_} ]]; then
-            IFS="|" read -r c_name _ <<< "${DEV_INFO[$c_mac]}"
+            IFS="|" read -r c_name _ _ <<< "${DEV_INFO[$c_mac]}"
         else
             for key in "${!DEV_INFO[@]}"; do
                 if [[ "${DEV_INFO[$key]}" == *"$c_ip"* ]]; then
-                    IFS="|" read -r c_name _ <<< "${DEV_INFO[$key]}"
+                    IFS="|" read -r c_name _ _ <<< "${DEV_INFO[$key]}"
                     break
                 fi
             done
@@ -214,9 +214,9 @@ while IFS='=' read -r RAW_MAC RAW_QUOTA || [ -n "$RAW_MAC" ]; do
 
     # 2. جلب بيانات الجهاز من المصفوفة
     if [[ -n "${DEV_INFO[$MAC]}" ]]; then
-        IFS="|" read -r NAME IP <<< "${DEV_INFO[$MAC]}"
+        IFS="|" read -r NAME IP CHAT_ID <<< "${DEV_INFO[$MAC]}"
     else
-        NAME="Unknown"; IP="127.0.0.1" # افتراضي عشان الـ ping ميعلقش
+        NAME="Unknown"; IP="127.0.0.1"
     fi
     
     SAFE_MAC=${MAC//:/}
@@ -253,7 +253,7 @@ while IFS='=' read -r RAW_MAC RAW_QUOTA || [ -n "$RAW_MAC" ]; do
     [[ -z "$LAST_EVENT" ]] && LAST_EVENT="No events recorded"
 
     # 7. الطباعة النهائية (تقريب الرقم داخل printf لضمان الدقة)
-    printf "${ROW_COLOR}%-15s | %-12.2f MB | %-10s | %s${NC}\n" "$NAME" "$USAGE" "$QUOTA_MB MB" "$STATUS_MSG ($CONN_MSG)"
+    printf "${ROW_COLOR}%-15s | %-9.2f MB | %-10s | %s${NC}\n" "$NAME" "$USAGE" "${QUOTA_MB} MB" "$STATUS_MSG ($CONN_MSG)"
     echo -e "   ${BLUE}╚═ Last Event: ${LAST_EVENT}${NC}"
 
 done < "$QUOTA_FILE"
