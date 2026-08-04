@@ -1,0 +1,261 @@
+#!/bin/bash
+# /home/es/projects/hotspot-control/scripts/show-quota
+# المسارات الجديدة والموحدة
+BASE_DIR="/home/es/projects/hotspot-control/data"
+USAGE_DB="$BASE_DIR/usage.sqlite"
+QUOTA_FILE="$BASE_DIR/quotas.conf"
+LAST_SEEN_DIR="$BASE_DIR/last_seen"
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
+NC='\033[0m' # No Color (لإعادة اللون للطبيعي)
+mkdir -p "$LAST_SEEN_DIR"
+
+# استبدل المصفوفة بهذا الجزء في show-quota و start-quota
+declare -A DEV_INFO 
+source "$BASE_DIR/devices.conf"
+# ... (تعريف الألوان والمصفوفة DEV_INFO هنا) ...
+
+# فحص حالة محدد السرعة للإيثرنت بشكل ديناميكي (الرفع والتحميل)
+if tc qdisc show dev ifb0 2>/dev/null | grep -q "rate"; then
+    # 1. استخراج سرعة التحميل من الواجهة الوهمية
+    DL_VAL=$(tc qdisc show dev ifb0 | grep -oP 'rate \K[^ ]+')
+    
+    # 2. استخراج سرعة الرفع من الواجهة الفيزيائية
+    UL_VAL=$(tc qdisc show dev enp2s0f0 | grep -oP 'rate \K[^ ]+')
+    
+    # تنسيق العرض
+    ETH_STATUS="${RED}LIMITED (DL: $DL_VAL | UL: $UL_VAL)${NC}"
+else
+    ETH_STATUS="${GREEN}FULL SPEED${NC}"
+fi
+
+
+# --- [ 1. إضافة: قسم مراقبة الباقة العالمية في القمة ] ---
+ISP_STATS_DB="/home/es/projects/isp-tracker/stats.db"
+ISP_CONF="/home/es/projects/isp-tracker/config.conf"
+
+if [ -f "$ISP_STATS_DB" ] && [ -f "$ISP_CONF" ]; then
+    source "$ISP_CONF"
+    
+    # 1. جلب البيانات الخام والواجهة النشطة
+    raw_isp_bytes=$(cat "$ISP_STATS_DB")
+    active_iface=$(ip route show default | awk '/default/ {print $5; exit}')
+    active_iface="${active_iface:-N/A}"
+    [[ $active_iface == w* ]] && conn_type="WiFi 📶" || conn_type="Ethernet 🔌"
+
+    # 2. حساب السرعة اللحظية
+    iface_path="/sys/class/net/$active_iface/statistics"
+    rx1=$(cat $iface_path/rx_bytes); tx1=$(cat $iface_path/tx_bytes)
+    sleep 0.2
+    rx2=$(cat $iface_path/rx_bytes); tx2=$(cat $iface_path/tx_bytes)
+    # استبدل السطرين القديمين بهذين (لأنك أصبحت تقيس خلال 0.2 ثانية فقط)
+    dl_mbps=$(echo "scale=2; (($rx2 - $rx1) * 8) / 1024 / 1024 / 0.2" | bc)
+    ul_mbps=$(echo "scale=2; (($tx2 - $tx1) * 8) / 1024 / 1024 / 0.2" | bc)
+
+    # 3. حسابات الاستهلاك والوقت
+    used_isp_gb=$(printf "%.2f" $(echo "scale=4; $raw_isp_bytes / 1024 / 1024 / 1024" | bc))
+    isp_usage_percent=$(echo "scale=0; ($used_isp_gb * 100) / $TOTAL_QUOTA_GB" | bc)
+    
+    today_seconds=$(date +%s)
+    renewal_seconds=$(date -d "$RENEWAL_DATE" +%s)
+    days_passed=$(( (today_seconds - renewal_seconds) / 86400 ))
+    days_left=$(( PLAN_DAYS - days_passed ))
+    [ "$days_left" -lt 0 ] && days_left=0
+    expiry_date=$(date -d "$RENEWAL_DATE + $PLAN_DAYS days" "+%d %b %Y")
+
+    # 4. حساب التوقعات (Forecast)
+    if [ "$days_passed" -gt 0 ]; then
+        daily_avg=$(echo "scale=2; $used_isp_gb / $days_passed" | bc)
+        remaining_gb=$(echo "scale=2; $TOTAL_QUOTA_GB - $used_isp_gb" | bc)
+        days_to_deplete=$(echo "scale=0; $remaining_gb / $daily_avg" | bc)
+        depletion_date=$(date -d "today + $days_to_deplete days" "+%d %b %Y")
+    else
+        daily_avg=$used_isp_gb
+        depletion_date="Calculating..."
+    fi
+
+    # 5. العرض البصري (ISP Status)
+    [ "$isp_usage_percent" -ge 90 ] && ISP_COLOR='\033[0;31m' || ISP_COLOR='\033[0;32m'
+    
+    # تحديد ألوان السرعة (Download > 3M أو Upload > 2M يتحول للأحمر)
+    [[ $(echo "$dl_mbps > 3.0" | bc) -eq 1 ]] && DL_COLOR='\033[0;31m' || DL_COLOR='\033[0;32m'
+    [[ $(echo "$ul_mbps > 2.0" | bc) -eq 1 ]] && UL_COLOR='\033[0;31m' || UL_COLOR='\033[0;32m'
+
+    echo -e "${BLUE}--- GLOBAL ISP STATUS (${TOTAL_QUOTA_GB}GB Plan) ---${NC}"
+    printf "${BLUE}Source:${NC} %-10s %-12s | ${BLUE}Start:${NC} %-10s | ${BLUE}Days Left:${NC} ${GREEN}%s${NC}/%s\n" \
+        "$active_iface" "($conn_type)" "$RENEWAL_DATE" "$days_left" "$PLAN_DAYS"
+    
+    # عرض الاستهلاك والسرعة مع تنسيق الأرقام العشرية
+    printf "Global Usage: ${ISP_COLOR}%-5s GB${NC} / ${BLUE}%s GB (%s%%)${NC} | ${YELLOW}Live:${NC} ↓ ${DL_COLOR}%0.2f Mbps${NC} ↑ ${UL_COLOR}%0.2f Mbps${NC}\n" \
+        "$used_isp_gb" "$TOTAL_QUOTA_GB" "$isp_usage_percent" "$dl_mbps" "$ul_mbps"
+    
+    # شريط التقدم وسطر التوقعات
+    bar_len=40
+    filled=$(( isp_usage_percent * bar_len / 100 ))
+    empty=$(( bar_len - filled ))
+    printf "${ISP_COLOR}["
+    printf "%${filled}s" | tr ' ' '#'
+    printf "${NC}%${empty}s" | tr ' ' '-'
+    echo -e "${ISP_COLOR}]${NC}"
+
+    # حساب لون التوقعات
+    if [[ "$depletion_date" == "Calculating..." ]]; then
+        FORECAST_COLOR='\033[1;33m'; WARN_MSG=""
+    else
+        dep_sec=$(date -d "$depletion_date" +%s 2>/dev/null); exp_sec=$(date -d "$expiry_date" +%s 2>/dev/null)
+        if [ "$dep_sec" -lt "$exp_sec" ]; then FORECAST_COLOR='\033[0;31m'; WARN_MSG=" [CRITICAL: REDUCE USAGE]"
+        else FORECAST_COLOR='\033[0;32m'; WARN_MSG=""; fi
+    fi
+    echo -e "${FORECAST_COLOR}Forecast:${NC} Avg: ${FORECAST_COLOR}${daily_avg} GB/Day${NC} | Est. Depletion: ${FORECAST_COLOR}${depletion_date}${NC}${RED}${WARN_MSG}${NC}"
+    fi # <--- هذه الـ fi كانت ناقصة أو في مكان خاطئ وهي سبب الخطأ
+    # --- [ إضافة: قسم المتصلين الآن ] ---
+echo -e "${YELLOW}Connected Clients (Hotspot):${NC}"
+# استخراج الأجهزة المتصلة فعلياً
+active_clients=$(ip neigh show dev wlp3s0 | grep "REACHABLE")
+
+if [ -z "$active_clients" ]; then
+    echo -e "  ${RED}No active clients connected.${NC}"
+else
+    client_count=0
+    while read -r line; do
+        c_ip=$(echo "$line" | awk '{print $1}' | xargs)
+        c_mac=$(echo "$line" | grep -oE '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}' | xargs | tr '[:upper:]' '[:lower:]')
+        
+        c_name="Unknown"
+        if [[ -n "$c_mac" && ${DEV_INFO[$c_mac]+_} ]]; then
+            IFS="|" read -r c_name _ <<< "${DEV_INFO[$c_mac]}"
+        else
+            for key in "${!DEV_INFO[@]}"; do
+                if [[ "${DEV_INFO[$key]}" == *"$c_ip"* ]]; then
+                    IFS="|" read -r c_name _ <<< "${DEV_INFO[$key]}"
+                    break
+                fi
+            done
+        fi
+
+        # --- التعديل يبدأ من هنا ---
+        # تحديد لون الاسم (أزرق للمعرف، أحمر فاقع للغرباء)
+        if [[ "$c_name" == "Unknown" ]]; then
+            NAME_DISPLAY_COLOR="${RED}"
+            WARN_TAG=" [! UNKNOWN DEVICE !]"
+        else
+            NAME_DISPLAY_COLOR="${BLUE}"
+            WARN_TAG=""
+        fi
+        
+        # سطر الطباعة المطور (بدلاً من القديم)
+        printf "  ⚡ ${GREEN}%-15s${NC} | ${NAME_DISPLAY_COLOR}%-15s${NC} | ${YELLOW}(%s)${NC}${RED}%s${NC}\n" "$c_ip" "$c_name" "$c_mac" "$WARN_TAG"
+        # --- التعديل ينتهي هنا ---
+
+        ((client_count++))
+    done <<< "$active_clients"
+    echo -e "  Total Active: ${YELLOW}$client_count${NC}"
+fi
+echo -e "${BLUE}---------------------------------------------------------------------------------------${NC}"
+
+
+
+# --- [ 2. طباعة عنوان اللوحة الرئيسية ] ---
+echo -e "${BLUE}--- Guardian Ultra Control Panel (Live Status) ---${NC}"
+echo -e "Ethernet Source Status: $ETH_STATUS"
+echo -e "${BLUE}---------------------------------------------------------------------------------------${NC}"
+printf "${BLUE}%-15s | %-12s | %-10s | %-35s${NC}\n" "Device" "Usage" "Quota" "Status"
+
+
+# --- [ 3. حسابات ThinkPad (Master) ] ---
+eth_rx=$(cat /sys/class/net/enp2s0f0/statistics/rx_bytes)
+eth_tx=$(cat /sys/class/net/enp2s0f0/statistics/tx_bytes)
+
+# الحسابات بالبايت الخام أولاً للدقة
+raw_total_eth=$((eth_rx + eth_tx))
+
+# تحويل الوحدات (ميجا وجيجا)
+total_eth_mb=$(echo "scale=2; $raw_total_eth / 1024 / 1024" | bc)
+total_eth_gb=$(echo "scale=4; $raw_total_eth / 1024 / 1024 / 1024" | bc)
+
+# جلب إجمالي الـ HS من الـ DB
+total_hotspot_mb=$(sqlite3 "$USAGE_DB" "SELECT SUM(usage) FROM devices;" | xargs)
+total_hotspot_mb=${total_hotspot_mb:-0}
+
+# حساب استهلاك اللابتوب الصافي (PC Only)
+thinkpad_only_mb=$(echo "$total_eth_mb - $total_hotspot_mb" | bc)
+if (( $(echo "$thinkpad_only_mb < 0" | bc -l) )); then thinkpad_only_mb="0.0"; fi
+
+# العرض المطور (إضافة الجيجا بجانب الميجا في خانة Total)
+printf "${MAGENTA}%-15s | PC:%-8.1f | HS:%-8.1f | Total: %-7.2f MB (%-6s GB) | %s${NC}\n" \
+    "This-ThinkPad" "$thinkpad_only_mb" "$total_hotspot_mb" "$total_eth_mb" "$total_eth_gb" "System (Master)"
+
+# --- [ تريك: جلب ملك السحب ] ---
+# ORDER BY usage DESC تعني ترتيب من الأكبر للأصغر، و LIMIT 1 تعني هات أول واحد بس
+top_mac=$(sqlite3 "$USAGE_DB" "SELECT mac FROM devices ORDER BY usage DESC LIMIT 1;")
+top_usage=$(sqlite3 "$USAGE_DB" "SELECT usage FROM devices ORDER BY usage DESC LIMIT 1;")
+
+if [ -z "$top_usage" ]; then
+    top_display="${YELLOW}No data yet${NC}"
+else
+    IFS="|" read -r top_name _ <<< "${DEV_INFO[$top_mac]}"
+    top_display="${RED}${top_name:-Unknown} (${top_usage} MB)${NC}"
+fi
+
+echo -e "🏆 Top Consumer: $top_display"
+echo -e "${BLUE}---------------------------------------------------------------------------------------${NC}"
+
+
+
+while IFS='=' read -r RAW_MAC RAW_QUOTA || [ -n "$RAW_MAC" ]; do
+    # 1. تنظيف الماك (حذف مسافات، حروف صغيرة، حذف محارف ويندوز \r)
+    MAC=$(echo "$RAW_MAC" | tr -d '\r' | xargs | tr '[:upper:]' '[:lower:]')
+    QUOTA_MB=$(echo "$RAW_QUOTA" | tr -d '\r' | xargs)
+    
+    [ -z "$MAC" ] && continue
+
+    # 2. جلب بيانات الجهاز من المصفوفة
+    if [[ -n "${DEV_INFO[$MAC]}" ]]; then
+        IFS="|" read -r NAME IP <<< "${DEV_INFO[$MAC]}"
+    else
+        NAME="Unknown"; IP="127.0.0.1" # افتراضي عشان الـ ping ميعلقش
+    fi
+    
+    SAFE_MAC=${MAC//:/}
+
+    # 3. جلب الاستهلاك مع تنظيف النتيجة (xargs)
+    USAGE=$(sqlite3 -batch "$USAGE_DB" "SELECT COALESCE(usage, 0.00) FROM devices WHERE mac='$MAC';" | xargs)
+    [[ -z "$USAGE" ]] && USAGE="0.00"
+
+    # 4. فحص حالة الحظر (جدول raw) - استخدم -qi للبحث غير الحساس للحالة
+    if sudo iptables-legacy -t raw -L PREROUTING -n 2>/dev/null | grep -qi "DROP.*$MAC"; then
+        STATUS_MSG="Blocked"
+        ROW_COLOR="$RED"
+        CONN_MSG="N/A"
+    else
+        STATUS_MSG="Active"
+        # 5. فحص الاتصال
+        if ping -c 1 -W 0.1 "$IP" > /dev/null 2>&1; then
+            CONN_MSG="Online"
+            ROW_COLOR="$GREEN"
+            date '+%d %b %H:%M:%S' > "$LAST_SEEN_DIR/$SAFE_MAC"
+        else
+            ROW_COLOR="$YELLOW"
+            if [ -f "$LAST_SEEN_DIR/$SAFE_MAC" ]; then
+                CONN_MSG="Seen: $(cat "$LAST_SEEN_DIR/$SAFE_MAC")"
+            else
+                CONN_MSG="Offline"
+            fi
+        fi
+    fi
+
+    # 6. جلب آخر حدث مع تحويل التوقيت لمحلي (Localtime)
+    LAST_EVENT=$(sqlite3 -batch "$USAGE_DB" ".timeout 5000" "SELECT '[' || strftime('%Y-%m-%d %H:%M', timestamp, 'localtime') || '] ' || event_type || ': ' || message FROM system_logs WHERE mac='$MAC' ORDER BY timestamp DESC LIMIT 1;" | xargs)
+
+    [[ -z "$LAST_EVENT" ]] && LAST_EVENT="No events recorded"
+
+    # 7. الطباعة النهائية (تقريب الرقم داخل printf لضمان الدقة)
+    printf "${ROW_COLOR}%-15s | %-12.2f MB | %-10s | %s${NC}\n" "$NAME" "$USAGE" "$QUOTA_MB MB" "$STATUS_MSG ($CONN_MSG)"
+    echo -e "   ${BLUE}╚═ Last Event: ${LAST_EVENT}${NC}"
+
+done < "$QUOTA_FILE"
+
+echo -e "---------------------------------------------------------------------------------------\n"

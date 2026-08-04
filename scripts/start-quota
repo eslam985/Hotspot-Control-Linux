@@ -1,0 +1,197 @@
+#!/bin/bash
+# /home/es/projects/hotspot-control/scripts/start-quota
+# --- المسارات الموحدة الجديدة ---
+BASE_DIR="/home/es/projects/hotspot-control/data"
+LOG_DIR="$BASE_DIR/logs"
+QUOTA_FILE="$BASE_DIR/quotas.conf"
+USAGE_DB="$BASE_DIR/usage.sqlite"
+
+
+
+# التأكد من وجود المجلد والملف وصلاحيات الكتابة والملكية
+# التأكد من وجود المجلد
+mkdir -p "$BASE_DIR"
+
+# التأكد أن ملف القاعدة موجود، ولو مش موجود ننشئه بالجدول فوراً
+[ ! -f "$USAGE_DB" ] && sqlite3 "$USAGE_DB" ".timeout 5000" "CREATE TABLE devices (mac TEXT PRIMARY KEY, name TEXT, usage REAL);"
+# مصفوفات لتتبع الحالة اللحظية
+declare -A LAST_RAW_BYTES   # آخر قراءة للعداد
+declare -A IS_ONLINE        # حالة الجهاز الحالية
+declare -A SESSION_START_VAL # استهلاك الجهاز عند بداية الجلسة
+
+# تعريف الأجهزة (الاسم والماك والآي بي)
+# استبدل المصفوفة بهذا الجزء في show-quota و start-quota
+declare -A DEV_INFO
+# استدعاء ملف الأجهزة
+source "$BASE_DIR/devices.conf"
+
+# تحديث قاعدة البيانات آلياً بناءً على الملف
+for mac in "${!DEV_INFO[@]}"; do
+    IFS='|' read -r name ip <<< "${DEV_INFO[$mac]}"
+    sqlite3 "$USAGE_DB" "INSERT OR IGNORE INTO devices (mac, name, usage) VALUES ('$mac', '$name', 0.0);"
+    # لتحديث الاسم لو غيرته في الملف
+    sqlite3 "$USAGE_DB" "UPDATE devices SET name='$name' WHERE mac='$mac';"
+done
+
+
+
+# دالة تحويل البايت لوحدات مقروءة (MB/GB)
+human_readable() {
+    local bytes=$1
+    if (( $(echo "$bytes > 1073741824" | bc -l) )); then
+        echo "$(echo "scale=2; $bytes / 1073741824" | bc) GB"
+    else
+        echo "$(echo "scale=2; $bytes / 1048576" | bc) MB"
+    fi
+}
+
+
+# تنظيف جدول المانجل فقط، وترك الـ FORWARD كما رتبه hkey
+sudo iptables -t mangle -F 2>/dev/null
+
+for MAC in "${!DEV_INFO[@]}"; do
+    IFS="|" read -r NAME IP <<< "${DEV_INFO[$MAC]}"
+    
+    # [التعديل الجوهري] إنشاء قواعد العد في أول جدول FORWARD
+    # القاعدة 1: مراقبة الرفع (Upload) بالماك
+
+    sudo iptables -I FORWARD 1 -m mac --mac-source "$MAC" -j ACCEPT 2>/dev/null
+    # القاعدة 2: مراقبة التحميل (Download) بالآي بي
+    sudo iptables -I FORWARD 2 -d "$IP" -j ACCEPT 2>/dev/null
+    
+    # القاعدة 3: منع تزوير الآي بي (اختياري لكن مهم للأمان)
+    sudo iptables -I FORWARD 3 -m mac --mac-source "$MAC" ! -s "$IP" -j DROP 2>/dev/null
+done
+
+# ... (بقية السكريبت كما هو)
+cleanup() {
+    echo -e "\n[!] System Shutdown. Protecting data..."
+    exit
+}
+trap cleanup SIGINT SIGTERM SIGHUP EXIT
+
+echo "Guardian Ultra: Live & Persistent Mode Active."
+
+# مصفوفة جديدة لحفظ قيمة الكوتا القديمة لمقارنتها
+declare -A LAST_QUOTA_VAL
+for MAC_KEY in "${!DEV_INFO[@]}"; do
+    LAST_QUOTA_VAL[$MAC_KEY]="INIT"
+done
+while true; do
+    # 1. قراءة ملف الكوتا سطر بسطر
+    while IFS='=' read -r RAW_MAC RAW_QUOTA || [ -n "$RAW_MAC" ]; do
+        
+        # تصفية البيانات
+        MAC=$(echo "$RAW_MAC" | tr -d '\r' | xargs | tr '[:upper:]' '[:lower:]')
+        QUOTA_MB=$(echo "$RAW_QUOTA" | tr -d '\r' | xargs)
+        
+        [ -z "$MAC" ] && continue
+        if [[ -z "${DEV_INFO[$MAC]}" ]]; then continue; fi
+        IFS="|" read -r NAME IP <<< "${DEV_INFO[$MAC]}"
+
+        # --- [ أولوية قصوى: التصفير أولاً ] ---
+        # لو الكوتا اتغيرت، بنصفر كل حاجة قبل ما نحسب أي بايت واحد
+# --- [ أولوية قصوى: التصفير أولاً ] ---
+        JUST_RESET=false # نعتبره false في بداية كل لفة لكل جهاز
+        
+        if [[ -n "${LAST_QUOTA_VAL[$MAC]}" && "${LAST_QUOTA_VAL[$MAC]}" != "INIT" && "${LAST_QUOTA_VAL[$MAC]}" != "$QUOTA_MB" ]]; then
+             sqlite3 "$USAGE_DB" ".timeout 5000" "INSERT INTO system_logs (timestamp, mac, event_type, message) VALUES (datetime('now', 'localtime'), '$MAC', 'RESET', 'Quota updated to $QUOTA_MB MB. Resetting usage for $NAME.');"
+             # أضف هذا السطر تحت سطر sqlite3 الخاص بالـ RESET
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] ACTION: Quota updated to $QUOTA_MB MB. Counter zeroed for $NAME." >> "$LOG_DIR/$NAME.log"
+             sqlite3 "$USAGE_DB" ".timeout 5000" "UPDATE devices SET usage='0.00' WHERE mac='$MAC';"
+             
+             SESSION_START_VAL[$MAC]=0
+             LAST_RAW_BYTES[$MAC]=0 
+             TOTAL_BYTES=0
+             NEW_TOTAL_MB=0
+             JUST_RESET=true # <--- علمنا عليه إنه لسه متصفر حالا
+             
+             sudo iptables -t raw -D PREROUTING -m mac --mac-source "$MAC" -j DROP 2>/dev/null
+             echo "[!] RESET applied for $NAME. Counters cleared."
+        fi
+
+        # تحديث قيمة الكوتا للمقارنة القادمة
+        [[ -n "$QUOTA_MB" ]] && LAST_QUOTA_VAL[$MAC]=$QUOTA_MB
+
+        # --- [ الحسابات اللحظية ] ---
+        
+        # 1. صيد الإجمالي من tcpdump
+        RAW_TOTAL_BYTES=$(grep -E " > $IP|$IP\.[0-9]+ > " /tmp/hotspot_traffic.raw | awk '{
+            for (i=1; i<=NF; i++) {
+                if ($i == "length") {
+                    gsub(/[^0-9]/, "", $(i+1));
+                    sum += $(i+1);
+                    break;
+                }
+            }
+        } END {print sum}')
+        
+        # 2. تحديث نقطة الصفر لو كانت أول مرة للجهاز
+        if [[ "${LAST_RAW_BYTES[$MAC]}" == "0" || -z "${LAST_RAW_BYTES[$MAC]}" ]]; then
+             LAST_RAW_BYTES[$MAC]=${RAW_TOTAL_BYTES:-0}
+        fi
+
+        # 3. حساب استهلاك الجلسة (الحالي - القديم)
+        TOTAL_BYTES=$(echo "${RAW_TOTAL_BYTES:-0} - ${LAST_RAW_BYTES[$MAC]:-0}" | bc)
+        
+        # 4. سحب الرصيد التراكمي من القاعدة لو أول مرة
+        if [[ -z "${SESSION_START_VAL[$MAC]}" ]]; then
+           OLD_VAL=$(sqlite3 -batch "$USAGE_DB" ".timeout 5000" "SELECT COALESCE(usage, 0.00) FROM devices WHERE mac='$MAC';")
+            SESSION_START_VAL[$MAC]=${OLD_VAL:-0}
+        fi
+
+        # 5. تحويل للميجا وحساب الإجمالي النهائي
+        CURRENT_SESSION_MB=$(echo "scale=2; ${TOTAL_BYTES:-0} / 1048576" | bc | sed 's/^\./0./')
+        
+        # منع الحساب في أول لفة لتجنب القفزات
+        if [[ "${LAST_QUOTA_VAL[$MAC]}" == "INIT" ]]; then CURRENT_SESSION_MB=0; fi
+
+        NEW_TOTAL_MB=$(echo "scale=2; ${SESSION_START_VAL[$MAC]} + $CURRENT_SESSION_MB" | bc | sed 's/^\./0./; s/^-\./-0./')
+
+        # --- [ هنا يكمل كود الحظر الباقي كما هو عندك ] ---
+# 8. منطق الحظر الذكي (استخدام القوة في جدول RAW لضمان القطع)
+# 8. منطق الحظر الذكي (إضافة حماية الـ RESET)
+        V1=${NEW_TOTAL_MB:-0}
+        V2=${QUOTA_MB:-0}
+        IS_BLOCKED=$(echo "$V1 >= $V2" | bc -l | xargs)
+
+        # --- [ تعديل الحماية الأهم ] ---
+        # لو الجهاز معدي الكوتا (IS_BLOCKED=1) بس لسه عامل ريسيت حالا (JUST_RESET=true)
+        # السكريبت هيتجاهل الحظر في اللفة دي عشان يلحق يصفر الذاكرة
+        
+        if [ "$IS_BLOCKED" = "1" ] && [ "$JUST_RESET" = false ]; then
+             # حذف أي سماح سابق
+             sudo iptables -D FORWARD -d "$IP" -j ACCEPT 2>/dev/null
+             
+             # الحظر في جدول RAW
+             if ! sudo iptables -t raw -L PREROUTING -n 2>/dev/null | grep -q "DROP.*$MAC"; then
+                sudo iptables -t raw -I PREROUTING -m mac --mac-source "$MAC" -j DROP 2>/dev/null
+                sqlite3 "$USAGE_DB" ".timeout 5000" "INSERT INTO system_logs (timestamp, mac, event_type, message) VALUES (datetime('now', 'localtime'), '$MAC', 'BLOCK', 'Device $NAME reached its quota of $QUOTA_MB MB and was hard-blocked.');"
+                # أضف هذا السطر تحت سطر sqlite3 الخاص بالـ BLOCK
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] ALERT: Reached $QUOTA_MB MB. Status: HARD-BLOCKED." >> "$LOG_DIR/$NAME.log"
+             fi
+        else
+             # فك الحظر في حالتين: (إما الكوتا كافية) أو (لسه عامل ريسيت حالا)
+             if sudo iptables -t raw -L PREROUTING -n 2>/dev/null | grep -q "DROP.*$MAC"; then
+                sudo iptables -t raw -D PREROUTING -m mac --mac-source "$MAC" -j DROP 2>/dev/null
+                # نسجل UNBLOCK فقط لو مش RESET
+                if [ "$JUST_RESET" = false ]; then
+                    sqlite3 "$USAGE_DB" ".timeout 5000" "INSERT INTO system_logs (timestamp, mac, event_type, message) VALUES (datetime('now', 'localtime'), '$MAC', 'UNBLOCK', 'New quota detected for $NAME. Internet access restored.');"
+                    # أضف هذا السطر تحت سطر sqlite3 الخاص بالـ UNBLOCK
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] INFO: Internet access restored for $NAME (New Quota)." >> "$LOG_DIR/$NAME.log"
+                fi
+             fi
+             
+             # إعادة السماح في جدول FORWARD
+             if ! sudo iptables -L FORWARD -n 2>/dev/null | grep -q "ACCEPT.*$IP"; then
+                sudo iptables -A FORWARD -d "$IP" -j ACCEPT 2>/dev/null
+             fi
+
+             # تحديث قاعدة البيانات بالاستهلاك الجديد (فقط لو مش محظور)
+             sqlite3 "$USAGE_DB" ".timeout 5000" "UPDATE devices SET usage='$NEW_TOTAL_MB' WHERE mac='$MAC';"
+        fi
+
+    done < "$QUOTA_FILE"
+    
+    sleep 2
+done

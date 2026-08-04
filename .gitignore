@@ -1,0 +1,12 @@
+# تجاهل مجلدات السجلات والظهور المؤقت
+data/logs/
+data/last_seen/
+
+# تجاهل ملفات قواعد البيانات الحية
+data/usage.db
+data/usage.sqlite
+
+# تجاهل ملفات التشغيل المؤقتة
+data/run.txt
+
+.fuse_hidden*
